@@ -1,9 +1,6 @@
-import asyncio
 import json
 import logging
-import os
 import re
-import sys
 import aiohttp
 from typing import Dict, Any, List, Tuple
 
@@ -44,7 +41,6 @@ class OzonClient:
 
     @staticmethod
     def _extract_real_sku(info_item: Dict[str, Any]) -> str:
-        """Извлекает реальный публичный SKU Ozon (например 1628039820) вместо внутреннего product_id."""
         sku_val = info_item.get("sku") or info_item.get("fbo_sku") or info_item.get("fbs_sku")
         if sku_val and int(sku_val) > 0:
             return str(sku_val)
@@ -56,7 +52,6 @@ class OzonClient:
         return str(info_item.get("id") or info_item.get("product_id") or "")
 
     async def get_all_product_ids(self) -> List[Dict[str, str]]:
-        """Возвращает полный список товаров продавца с реальным SKU витрины Ozon."""
         url_list = f"{self.base_url}/v3/product/list"
         url_info = f"{self.base_url}/v3/product/info/list"
         raw_items = []
@@ -132,155 +127,13 @@ class OzonClient:
         if not val:
             return 0.0
         try:
-            # Заменяем неразрывные пробелы и валюту: "1 408 ₽" -> 1408.0
             s = str(val).replace("\u2009", "").replace("\xa0", "").replace(" ", "")
             clean = re.sub(r"[^\d.,]", "", s).replace(",", ".")
             return float(clean) if clean else 0.0
         except Exception:
             return 0.0
 
-    @classmethod
-    async def _scrape_ozon_storefront_playwright(cls, real_skus: List[str]) -> Dict[str, Dict[str, float]]:
-        """
-        Забирает реальные клиентские цены витрины Ozon:
-        - цену без Ozon Карты («С другими банками», напр. 1408 ₽)
-        - зеленую цену с Ozon Картой («С банками Ozon», напр. 1225 ₽)
-        через браузерный контекст Playwright (обходя антибот Ozon).
-        """
-        from playwright.async_api import async_playwright
-        storefront: Dict[str, Dict[str, float]] = {}
-        if not real_skus:
-            return storefront
-
-        is_win = sys.platform.startswith("win")
-        use_headed = is_win
-        browser = None
-        context = None
-
-        async with async_playwright() as p:
-            launch_args = [
-                "--disable-blink-features=AutomationControlled",
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
-                "--disable-software-rasterizer",
-                "--disable-extensions",
-                "--mute-audio",
-                "--no-zygote",
-                "--disable-background-networking",
-            ]
-            if use_headed:
-                launch_args.append("--window-position=-2400,-2400")
-            else:
-                launch_args.append("--headless=new")
-
-            try:
-                browser = await p.chromium.launch(
-                    headless=(not use_headed),
-                    args=launch_args
-                )
-                context = await browser.new_context(
-                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-                    viewport={"width": 1280, "height": 720},
-                    locale="ru-RU"
-                )
-                await context.add_init_script("""
-                    Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-                    window.chrome = { runtime: {} };
-                    Object.defineProperty(navigator, 'languages', {get: () => ['ru-RU', 'ru', 'en-US', 'en']});
-                    Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
-                """)
-                page = await context.new_page()
-
-                async def block_heavy(route, request):
-                    if request.resource_type in ("image", "media", "font", "stylesheet"):
-                        await route.abort()
-                    else:
-                        await route.continue_()
-
-                await page.route("**/*", block_heavy)
-
-                # 1. Проходим антибот-челлендж Ozon на первой карточке
-                first_sku = real_skus[0]
-                try:
-                    await page.goto(
-                        f"https://www.ozon.ru/api/entrypoint-api.bx/page/json/v2?url=/product/{first_sku}/",
-                        wait_until="domcontentloaded",
-                        timeout=20000
-                    )
-                    await page.wait_for_timeout(1500)
-                except Exception:
-                    pass
-
-                # 2. Запрашиваем JSON-карточки пачками по 15 штук параллельно внутри открытой сессии Ozon
-                chunks = [real_skus[i:i + 15] for i in range(0, len(real_skus), 15)]
-                for chunk in chunks:
-                    try:
-                        raw_results = await page.evaluate(
-                            """async (skus) => {
-                                const out = {};
-                                await Promise.all(skus.map(async (sku) => {
-                                    try {
-                                        const u = `/api/entrypoint-api.bx/page/json/v2?url=/product/${sku}/`;
-                                        const r = await fetch(u, { credentials: 'include', headers: { 'Accept': 'application/json' } });
-                                        if (!r.ok) return;
-                                        const d = await r.json();
-                                        const ws = d.widgetStates || {};
-                                        for (const k of Object.keys(ws)) {
-                                            if (k.includes('webPrice')) {
-                                                const obj = typeof ws[k] === 'string' ? JSON.parse(ws[k]) : ws[k];
-                                                out[sku] = {
-                                                    cardPrice: obj.cardPrice || obj.ozonCardPrice || '',
-                                                    price: obj.price || obj.originalPrice || ''
-                                                };
-                                                break;
-                                            }
-                                        }
-                                    } catch (e) {}
-                                }));
-                                return out;
-                            }""",
-                            chunk
-                        )
-                        if isinstance(raw_results, dict):
-                            for k_sku, val_obj in raw_results.items():
-                                card_p = cls._parse_float(val_obj.get("cardPrice"))
-                                reg_p = cls._parse_float(val_obj.get("price"))
-                                if card_p > 0 or reg_p > 0:
-                                    storefront[str(k_sku)] = {
-                                        "client_price": reg_p if reg_p > 0 else card_p,
-                                        "wallet_price": card_p if card_p > 0 else reg_p,
-                                    }
-                    except Exception:
-                        continue
-            except Exception as e:
-                logger.warning("Playwright Ozon storefront error: %s", e)
-            finally:
-                if context:
-                    try:
-                        await context.close()
-                    except Exception:
-                        pass
-                if browser:
-                    try:
-                        await browser.close()
-                    except Exception:
-                        pass
-                from utils import release_memory
-                release_memory()
-
-        logger.info("Ozon витрина: получены реальные клиентские цены для %s из %s SKU", len(storefront), len(real_skus))
-        return storefront
-
     async def get_prices(self, skus: List[str], offer_ids: List[str] | None = None) -> Dict[str, Dict[str, Any]]:
-        """
-        Получает:
-        - seller_price: цена продавца в ЛК Ozon (напр. 2501 ₽)
-        - client_price: цена для покупателя без Ozon Карты («С другими банками», напр. 1408 ₽)
-        - wallet_price: зеленая цена с Ozon Картой («С банками Ozon», напр. 1225 ₽)
-        - coinvest: реальный процент соинвеста Ozon (без фейковых коэффициентов)
-        """
         if not skus and not offer_ids:
             return {}
 
@@ -328,7 +181,17 @@ class OzonClient:
 
             pid_to_info: Dict[str, Dict[str, Any]] = {}
             pids_for_v5: List[int] = []
-            real_skus_list: List[str] = []
+
+            if info_items:
+                s_inf = info_items[0]
+                logger.info(
+                    "OZON V3 INFO SAMPLE (offer=%s): price=%s, marketing_price=%s, min_price=%s, price_indexes=%s",
+                    s_inf.get("offer_id"),
+                    s_inf.get("price"),
+                    s_inf.get("marketing_price"),
+                    s_inf.get("min_price"),
+                    json.dumps(s_inf.get("price_indexes") or {}, ensure_ascii=False)[:300]
+                )
 
             for inf in info_items:
                 pid_str = str(inf.get("id") or inf.get("product_id") or "")
@@ -336,8 +199,6 @@ class OzonClient:
                 offer_id = str(inf.get("offer_id") or "")
                 if pid_str.isdigit():
                     pids_for_v5.append(int(pid_str))
-                if real_sku and real_sku.isdigit():
-                    real_skus_list.append(real_sku)
 
                 pid_to_info[pid_str] = {
                     "real_sku": real_sku,
@@ -366,56 +227,46 @@ class OzonClient:
                             items = data.get("items")
                             if items is None and isinstance(data.get("result"), dict):
                                 items = data["result"].get("items", [])
+                            if items:
+                                logger.info("OZON V5 PRICE SAMPLE: %s", json.dumps(items[0], ensure_ascii=False)[:600])
                             for it in (items or []):
                                 pid_s = str(it.get("product_id") or "")
-                                v5_map[pid_s] = it.get("price") or {}
+                                v5_map[pid_s] = it
                 except Exception as e:
                     logger.warning("Ошибка Ozon v5 get_prices: %s", e)
-
-            # Собираем реальные цены с витрины Ozon через Playwright
-            storefront_map = await self._scrape_ozon_storefront_playwright(real_skus_list)
 
             all_pids = set(pid_to_info.keys()) | set(v5_map.keys())
             for pid_s in all_pids:
                 inf = pid_to_info.get(pid_s, {})
-                p_v5 = v5_map.get(pid_s, {})
+                it_v5 = v5_map.get(pid_s, {})
+                p_v5 = it_v5.get("price") or {}
+                mkt_actions = (it_v5.get("marketing_actions") or {}).get("actions") or []
 
                 real_sku = inf.get("real_sku") or pid_s
                 offer_id = inf.get("offer_id") or ""
 
-                # 1. Цена продавца в ЛК (например 2501 ₽)
                 base_seller_p = self._parse_float(p_v5.get("price")) or inf.get("price", 0.0)
                 fbo_action_p = self._parse_float(p_v5.get("marketing_seller_price")) or base_seller_p
-                seller_price = fbo_action_p if (0 < fbo_action_p < base_seller_p) else base_seller_p
+                seller_price = base_seller_p if base_seller_p > 0 else fbo_action_p
 
-                # 2. Реальные цены с витрины Ozon (если товар в наличии на витрине)
-                sf = storefront_map.get(real_sku, {})
-                sf_client_p = sf.get("client_price", 0.0)   # Напр. 1408 ₽ («С другими банками»)
-                sf_wallet_p = sf.get("wallet_price", 0.0)   # Напр. 1225 ₽ («С банками Ozon»)
+                candidates_client = [
+                    inf.get("marketing_price", 0.0),
+                    self._parse_float(p_v5.get("marketing_price")),
+                    self._parse_float(p_v5.get("retail_price")),
+                    fbo_action_p,
+                ]
+                for act in mkt_actions:
+                    act_p = self._parse_float(act.get("price") or act.get("action_price") or act.get("value"))
+                    if act_p > 0:
+                        candidates_client.append(act_p)
 
-                api_mkt_p = (
-                    inf.get("marketing_price", 0.0)
-                    or self._parse_float(p_v5.get("marketing_price"))
-                    or self._parse_float(p_v5.get("retail_price"))
-                )
+                valid_client = [c for c in candidates_client if c > 0]
+                client_price = min(valid_client) if valid_client else seller_price
+                wallet_price = client_price
 
-                if sf_client_p > 0:
-                    client_price = sf_client_p
-                    wallet_price = sf_wallet_p if sf_wallet_p > 0 else sf_client_p
-                elif api_mkt_p > 0 and api_mkt_p < seller_price:
-                    client_price = api_mkt_p
-                    wallet_price = api_mkt_p
-                else:
-                    # Если витрина не ответила — честно оставляем цену продавца и 0% (без фейковых * 0.915!)
-                    client_price = seller_price
-                    wallet_price = seller_price
-
-                # 3. Процент Соинвеста Ozon (считаем по цене витрины без карты относительно цены продавца, как на WB)
                 coinvest = 0
                 if seller_price > 0 and 0 < client_price < seller_price:
                     coinvest = round(((seller_price - client_price) / seller_price) * 100)
-                elif seller_price > 0 and 0 < wallet_price < seller_price:
-                    coinvest = round(((seller_price - wallet_price) / seller_price) * 100)
 
                 entry = {
                     "seller_price": round(seller_price, 2),
@@ -425,7 +276,6 @@ class OzonClient:
                     "real_sku": real_sku,
                     "product_id": pid_s,
                     "offer_id": offer_id,
-                    "from_storefront": bool(sf_client_p > 0),
                 }
                 result[real_sku] = entry
                 result[pid_s] = entry

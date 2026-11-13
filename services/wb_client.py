@@ -233,60 +233,20 @@ class WBClient:
                 return {}
 
     @staticmethod
-    async def _fetch_batches_http(skus: List[str]) -> List[Dict[str, Any]]:
-        """Быстрый прямой HTTP-запрос к балансировщикам витрины WB."""
-        products = []
-        batches = [skus[i:i + 70] for i in range(0, len(skus), 70)]
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-            "Accept": "*/*",
-            "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
-            "Origin": "https://www.wildberries.ru",
-            "Referer": "https://www.wildberries.ru/",
-        }
-        endpoints = [
-            "https://card.wb.ru/cards/v2/detail?appType=1&curr=rub&dest=-1257786&spp=30",
-            "https://card.wb.ru/cards/v4/detail?appType=1&curr=rub&dest=-1257786&spp=30",
-            "https://u-card.wb.ru/cards/v4/detail?appType=1&curr=rub&dest=-1257786&spp=30",
-        ]
-
-        async with aiohttp.ClientSession(headers=headers) as session:
-            for idx, batch in enumerate(batches):
-                nm_str = ";".join(str(s) for s in batch)
-                batch_ok = False
-                for base_ep in endpoints:
-                    url = f"{base_ep}&nm={nm_str}"
-                    try:
-                        async with session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
-                            if resp.status == 200:
-                                data = await resp.json(content_type=None)
-                                items = data.get("products") or data.get("data", {}).get("products", [])
-                                if items:
-                                    products.extend(items)
-                                    batch_ok = True
-                                    break
-                    except Exception:
-                        continue
-                if idx == 0 and not batch_ok:
-                    return []
-        return products
-
-    @staticmethod
     async def _scrape_batches(skus: List[str], use_headed: bool) -> List[Dict[str, Any]]:
         from playwright.async_api import async_playwright
         products = []
         browser = None
         context = None
 
-        # На Linux в контейнере Bothost нет X-сервера, поэтому всегда используем headless=True,
-        # чтобы драйвер не падал с 'Connection closed while reading from the driver'
-        is_win = sys.platform.startswith("win")
-        if not is_win:
-            use_headed = False
+        # Очищаем битый DISPLAY на Linux, если нет реального X-сервера
+        if not sys.platform.startswith("win") and not use_headed:
+            os.environ.pop("DISPLAY", None)
 
         async with async_playwright() as p:
             launch_args = [
                 "--disable-blink-features=AutomationControlled",
+                "--window-position=-2400,-2400",
                 "--no-sandbox",
                 "--disable-setuid-sandbox",
                 "--disable-dev-shm-usage",
@@ -294,20 +254,15 @@ class WBClient:
                 "--disable-software-rasterizer",
                 "--disable-extensions",
                 "--mute-audio",
-                "--no-zygote",
-                "--disable-background-networking",
-                "--disable-default-apps",
-                "--disable-sync",
-                "--no-first-run",
             ]
-            if use_headed:
-                launch_args.append("--window-position=-2400,-2400")
-            else:
+            if not use_headed:
+                # Новый headless=new в сочетании с headless=False запускает полноценный Chromium (не headless_shell),
+                # который не падает без XServer и проходит антибот WB (_wbaas)
                 launch_args.append("--headless=new")
 
             try:
                 browser = await p.chromium.launch(
-                    headless=(not use_headed),
+                    headless=False,
                     args=launch_args
                 )
                 context = await browser.new_context(
@@ -324,38 +279,33 @@ class WBClient:
                 page = await context.new_page()
 
                 batches = [skus[i:i + 70] for i in range(0, len(skus), 70)]
-                captured_base_url = None
-                first_batch_received = False
+                current_batch_idx = 0
+                batch_received = False
 
                 async def intercept_requests(route, request):
-                    nonlocal captured_base_url
-                    if request.resource_type in ("image", "media", "font"):
+                    nonlocal current_batch_idx
+                    if request.resource_type in ("image", "media", "font", "stylesheet"):
                         await route.abort()
                         return
-                    req_url = request.url
-                    if any(bad in req_url for bad in ("yandex", "google", "mail.ru", "vk.com", "static-basket-01.wbbasket.ru/vol0/i/")):
-                        await route.abort()
-                        return
-                    if ("cards/v4/detail" in req_url or "cards/v2/detail" in req_url) and "nm=" in req_url:
-                        base_u = req_url.split("&nm=")[0]
-                        if not captured_base_url:
-                            captured_base_url = base_u
-                            batch_str = ";".join(batches[0])
-                            await route.continue_(url=f"{base_u}&nm={batch_str}")
-                            return
-                    await route.continue_()
+                    if "u-card/cards/v4/detail" in request.url and current_batch_idx < len(batches) and "nm=" in request.url:
+                        base_url = request.url.split("&nm=")[0]
+                        batch_str = ";".join(batches[current_batch_idx])
+                        new_url = f"{base_url}&nm={batch_str}"
+                        await route.continue_(url=new_url)
+                    else:
+                        await route.continue_()
 
                 await page.route("**/*", intercept_requests)
 
                 async def on_response(response):
-                    nonlocal first_batch_received
-                    if ("cards/v4/detail" in response.url or "cards/v2/detail" in response.url) and response.status == 200:
+                    nonlocal batch_received
+                    if "u-card/cards/v4/detail" in response.url and response.status == 200:
                         try:
                             data = await response.json()
                             items = data.get("products") or data.get("data", {}).get("products", [])
                             if items:
                                 products.extend(items)
-                                first_batch_received = True
+                                batch_received = True
                         except Exception:
                             pass
 
@@ -363,50 +313,33 @@ class WBClient:
 
                 anchor_sku = "503994462" if "503994462" in skus else ("995598603" if "995598603" in skus else skus[0])
 
-                try:
-                    await page.goto(
-                        f"https://www.wildberries.ru/catalog/{anchor_sku}/detail.aspx",
-                        wait_until="domcontentloaded",
-                        timeout=25000
-                    )
-                    for _ in range(30):
-                        if first_batch_received:
-                            break
-                        await page.wait_for_timeout(500)
-                except Exception as e:
-                    logger.warning("Ошибка первичного перехода на карточку WB: %s", e)
-
-                try:
-                    await page.evaluate("window.stop()")
-                except Exception:
-                    pass
-
-                api_template = captured_base_url or "https://u-card.wb.ru/cards/v4/detail?appType=1&curr=rub&dest=-1257786&spp=30"
-                start_batch = 1 if first_batch_received else 0
-
-                for idx in range(start_batch, len(batches)):
-                    batch_str = ";".join(batches[idx])
-                    target_url = f"{api_template}&nm={batch_str}"
+                for idx, batch in enumerate(batches):
+                    current_batch_idx = idx
+                    batch_received = False
                     try:
-                        batch_items = await page.evaluate(
-                            """async (url) => {
-                                try {
-                                    const r = await fetch(url, { credentials: 'include' });
-                                    if (!r.ok) return [];
-                                    const d = await r.json();
-                                    return d.products || (d.data && d.data.products) || [];
-                                } catch (e) {
-                                    return [];
-                                }
-                            }""",
-                            target_url
+                        await page.goto(
+                            f"https://www.wildberries.ru/catalog/{anchor_sku}/detail.aspx",
+                            wait_until="domcontentloaded",
+                            timeout=25000
                         )
-                        if batch_items:
-                            products.extend(batch_items)
-                        await page.wait_for_timeout(200)
+                        max_ticks = 30 if idx == 0 else 14
+                        for _ in range(max_ticks):
+                            if batch_received:
+                                break
+                            await page.wait_for_timeout(500)
                     except Exception as e:
-                        logger.warning("Ошибка fetch батча %s: %s", idx, e)
-
+                        # Если вкладка упала по памяти после нескольких батчей — пересоздаем чистую вкладку
+                        if "crashed" in str(e).lower() or "closed" in str(e).lower():
+                            try:
+                                await page.close()
+                            except Exception:
+                                pass
+                            try:
+                                page = await context.new_page()
+                                await page.route("**/*", intercept_requests)
+                                page.on("response", on_response)
+                            except Exception:
+                                break
             finally:
                 if context:
                     try:
@@ -428,29 +361,18 @@ class WBClient:
         if not skus:
             return {}
 
-        products = await cls._fetch_batches_http(skus)
-        if products:
-            logger.info("WB HTTP-опрос получил %s карточек.", len(products))
-        else:
-            is_win = sys.platform.startswith("win")
+        is_win = sys.platform.startswith("win")
+        has_display = is_win
+        products = []
+
+        for attempt in range(2):
             try:
-                products = await cls._scrape_batches(skus, use_headed=is_win)
-                logger.info("WB Playwright получил %s карточек.", len(products))
+                products = await cls._scrape_batches(skus, use_headed=has_display)
+                logger.info("WB Playwright получил %s карточек (attempt=%s).", len(products), attempt + 1)
+                if products:
+                    break
             except Exception as e:
-                err_str = str(e)
-                if "Executable doesn't exist" in err_str or "playwright install" in err_str:
-                    logger.warning("Chromium не найден. Запускаем автоустановку playwright install chromium...")
-                    try:
-                        await asyncio.to_thread(
-                            subprocess.run,
-                            [sys.executable, "-m", "playwright", "install", "chromium"],
-                            check=False
-                        )
-                        products = await cls._scrape_batches(skus, use_headed=is_win)
-                    except Exception:
-                        pass
-                else:
-                    logger.warning("Ошибка запуска браузера Playwright: %s", e)
+                logger.warning("Ошибка запуска браузера Playwright (attempt=%s): %s", attempt + 1, e)
 
         result = {}
         for p in products:
