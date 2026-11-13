@@ -182,17 +182,6 @@ class OzonClient:
             pid_to_info: Dict[str, Dict[str, Any]] = {}
             pids_for_v5: List[int] = []
 
-            if info_items:
-                s_inf = info_items[0]
-                logger.info(
-                    "OZON V3 INFO SAMPLE (offer=%s): price=%s, marketing_price=%s, min_price=%s, price_indexes=%s",
-                    s_inf.get("offer_id"),
-                    s_inf.get("price"),
-                    s_inf.get("marketing_price"),
-                    s_inf.get("min_price"),
-                    json.dumps(s_inf.get("price_indexes") or {}, ensure_ascii=False)[:300]
-                )
-
             for inf in info_items:
                 pid_str = str(inf.get("id") or inf.get("product_id") or "")
                 real_sku = self._extract_real_sku(inf)
@@ -228,7 +217,14 @@ class OzonClient:
                             if items is None and isinstance(data.get("result"), dict):
                                 items = data["result"].get("items", [])
                             if items:
-                                logger.info("OZON V5 PRICE SAMPLE: %s", json.dumps(items[0], ensure_ascii=False)[:600])
+                                # Выводим в лог именно блок price и marketing_actions первого товара (без обрезки!)
+                                s_it = items[0]
+                                logger.info(
+                                    "OZON V5 PRICE DETAIL (offer=%s): price_obj=%s | mkt_actions=%s",
+                                    s_it.get("offer_id"),
+                                    json.dumps(s_it.get("price") or {}, ensure_ascii=False),
+                                    json.dumps(s_it.get("marketing_actions") or {}, ensure_ascii=False)
+                                )
                             for it in (items or []):
                                 pid_s = str(it.get("product_id") or "")
                                 v5_map[pid_s] = it
@@ -240,27 +236,24 @@ class OzonClient:
                 inf = pid_to_info.get(pid_s, {})
                 it_v5 = v5_map.get(pid_s, {})
                 p_v5 = it_v5.get("price") or {}
-                mkt_actions = (it_v5.get("marketing_actions") or {}).get("actions") or []
 
                 real_sku = inf.get("real_sku") or pid_s
                 offer_id = inf.get("offer_id") or ""
 
+                # 1. Цена продавца
                 base_seller_p = self._parse_float(p_v5.get("price")) or inf.get("price", 0.0)
                 fbo_action_p = self._parse_float(p_v5.get("marketing_seller_price")) or base_seller_p
                 seller_price = base_seller_p if base_seller_p > 0 else fbo_action_p
 
+                # 2. Цена покупателя из официальных ценовых полей (без чтения процентов из marketing_actions!)
                 candidates_client = [
                     inf.get("marketing_price", 0.0),
                     self._parse_float(p_v5.get("marketing_price")),
                     self._parse_float(p_v5.get("retail_price")),
                     fbo_action_p,
                 ]
-                for act in mkt_actions:
-                    act_p = self._parse_float(act.get("price") or act.get("action_price") or act.get("value"))
-                    if act_p > 0:
-                        candidates_client.append(act_p)
-
-                valid_client = [c for c in candidates_client if c > 0]
+                # Отсекаем любые значения < 30 ₽, чтобы случайный процент скидки никогда не стал ценой
+                valid_client = [c for c in candidates_client if c >= 30.0]
                 client_price = min(valid_client) if valid_client else seller_price
                 wallet_price = client_price
 

@@ -2,6 +2,7 @@ import asyncio
 import logging
 import subprocess
 import sys
+from datetime import datetime, timezone, timedelta
 from aiogram import Bot, Dispatcher
 from aiogram.types import BotCommand, BotCommandScopeDefault
 from config import settings
@@ -9,7 +10,13 @@ from models import init_db
 from tasks.scheduler import setup_scheduler
 from handlers import base, settings as settings_handlers, actions, admin, subscription, profile
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+# Настраиваем вывод времени в логах строго по Москве (UTC+3)
+MSK_TZ = timezone(timedelta(hours=3))
+logging.Formatter.converter = lambda *args: datetime.now(MSK_TZ).timetuple()
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [MSK] - %(name)s - %(levelname)s - %(message)s"
+)
 
 
 def ensure_playwright_browser():
@@ -44,10 +51,7 @@ async def set_bot_commands(bot: Bot):
 
 
 async def main():
-    # 0. Убеждаемся, что Chromium скачан в контейнере Bothost
     await asyncio.to_thread(ensure_playwright_browser)
-
-    # 1. Инициализируем базу и создаем таблицы до старта поллинга
     await init_db()
 
     bot = Bot(token=settings.BOT_TOKEN)
