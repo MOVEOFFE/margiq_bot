@@ -253,12 +253,12 @@ class WBClient:
                 "--disable-software-rasterizer",
                 "--disable-extensions",
                 "--mute-audio",
-                "--no-zygote",
             ]
             if not use_headed:
                 launch_args.append("--headless=new")
 
             try:
+                # На Linux обязательно headless=True, чтобы не падало с Connection closed while reading from the driver
                 browser = await p.chromium.launch(
                     headless=(not use_headed),
                     args=launch_args
@@ -274,82 +274,77 @@ class WBClient:
                     Object.defineProperty(navigator, 'languages', {get: () => ['ru-RU', 'ru', 'en-US', 'en']});
                     Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
                 """)
-                page = await context.new_page()
 
                 batches = [skus[i:i + 70] for i in range(0, len(skus), 70)]
-                captured_template_url = None
-                first_batch_done = False
+                current_batch_idx = 0
+                batch_received = False
 
-                # Важно: НЕ блокируем stylesheet, иначе SPA Wildberries не отправляет запрос cards/v4/detail!
                 async def intercept_requests(route, request):
-                    nonlocal captured_template_url
+                    nonlocal current_batch_idx
                     if request.resource_type in ("image", "media", "font"):
                         await route.abort()
                         return
-                    if ("cards/v4/detail" in request.url or "cards/v2/detail" in request.url) and "nm=" in request.url:
+                    if ("cards/v4/detail" in request.url or "cards/v2/detail" in request.url) and current_batch_idx < len(batches) and "nm=" in request.url:
                         base_url = request.url.split("&nm=")[0]
-                        if not captured_template_url:
-                            captured_template_url = base_url
-                            batch_str = ";".join(batches[0])
-                            await route.continue_(url=f"{base_url}&nm={batch_str}")
-                            return
-                    await route.continue_()
-
-                await page.route("**/*", intercept_requests)
+                        batch_str = ";".join(batches[current_batch_idx])
+                        new_url = f"{base_url}&nm={batch_str}"
+                        await route.continue_(url=new_url)
+                    else:
+                        await route.continue_()
 
                 async def on_response(response):
-                    nonlocal first_batch_done
-                    if ("cards/v4/detail" in response.url or "cards/v2/detail" in response.url) and response.status == 200:
-                        try:
-                            data = await response.json()
-                            items = data.get("products") or data.get("data", {}).get("products", [])
-                            if items:
-                                products.extend(items)
-                                first_batch_done = True
-                        except Exception:
-                            pass
+                    nonlocal batch_received
+                    if ("cards/v4/detail" in response.url or "cards/v2/detail" in response.url):
+                        if response.status == 200:
+                            try:
+                                data = await response.json()
+                                items = data.get("products") or data.get("data", {}).get("products", [])
+                                if items:
+                                    products.extend(items)
+                                    batch_received = True
+                            except Exception:
+                                pass
+                        else:
+                            logger.warning("WB detail response status: %s for url %s", response.status, response.url[:100])
 
-                page.on("response", on_response)
+                anchor_sku = "1008034361" if "1008034361" in skus else ("503994462" if "503994462" in skus else skus[0])
 
-                anchor_sku = "503994462" if "503994462" in skus else ("995598603" if "995598603" in skus else skus[0])
-                try:
-                    await page.goto(
-                        f"https://www.wildberries.ru/catalog/{anchor_sku}/detail.aspx",
-                        wait_until="domcontentloaded",
-                        timeout=30000
-                    )
-                    for _ in range(35):
-                        if first_batch_done:
-                            break
-                        await page.wait_for_timeout(500)
-                except Exception as e:
-                    logger.warning("Ошибка загрузки якорной страницы WB: %s", e)
-
-                base_api = captured_template_url or "https://u-card.wb.ru/cards/v4/detail?appType=1&curr=rub&dest=-1257786&spp=30"
-                start_idx = 1 if first_batch_done else 0
-
-                for batch in batches[start_idx:]:
-                    batch_str = ";".join(batch)
-                    target_url = f"{base_api}&nm={batch_str}"
+                # Открываем новую чистую вкладку на каждый батч и сразу закрываем её,
+                # чтобы память не копилась и никогда не было Page crashed на батче 2!
+                for idx, batch in enumerate(batches):
+                    current_batch_idx = idx
+                    batch_received = False
+                    page = None
                     try:
-                        batch_items = await page.evaluate(
-                            """async (url) => {
-                                try {
-                                    const res = await fetch(url, { credentials: 'include' });
-                                    if (!res.ok) return [];
-                                    const data = await res.json();
-                                    return data.products || (data.data && data.data.products) || [];
-                                } catch (e) {
-                                    return [];
-                                }
-                            }""",
-                            target_url
+                        page = await context.new_page()
+                        await page.route("**/*", intercept_requests)
+                        page.on("response", on_response)
+
+                        resp = await page.goto(
+                            f"https://www.wildberries.ru/catalog/{anchor_sku}/detail.aspx",
+                            wait_until="domcontentloaded",
+                            timeout=25000
                         )
-                        if batch_items:
-                            products.extend(batch_items)
-                        await page.wait_for_timeout(200)
-                    except Exception:
-                        pass
+                        max_ticks = 30 if idx == 0 else 16
+                        for _ in range(max_ticks):
+                            if batch_received:
+                                break
+                            await page.wait_for_timeout(500)
+
+                        if idx == 0 and not batch_received:
+                            title = await page.title()
+                            st = resp.status if resp else "no_resp"
+                            logger.warning("WB DEBUG batch 0: не получен detail. HTTP=%s, Title='%s'", st, title)
+                            # Если даже 0-й батч заблокирован антиботом на IP сервера — не жжем время на остальные
+                            break
+                    except Exception as e:
+                        logger.warning("Ошибка перехода на карточку WB (батч %s): %s", idx, e)
+                    finally:
+                        if page:
+                            try:
+                                await page.close()
+                            except Exception:
+                                pass
             finally:
                 if context:
                     try:

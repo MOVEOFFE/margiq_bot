@@ -133,6 +133,30 @@ class OzonClient:
         except Exception:
             return 0.0
 
+    @classmethod
+    def _calc_storefront_from_index(cls, price_indexes: Dict[str, Any], seller_price: float) -> Tuple[float, float]:
+        """
+        Вычисляет реальную цену покупателя на витрине Ozon через официальный price_indexes API:
+        В Ozon price_index_value = (Цена на витрине Ozon с соинвестом) / minimal_price конкурента.
+        Отсюда: Цена на витрине = minimal_price * price_index_value.
+        """
+        if not price_indexes or seller_price <= 0:
+            return 0.0, 0.0
+
+        for key in ("external_index_data", "self_marketplaces_index_data", "ozon_index_data"):
+            block = price_indexes.get(key) or {}
+            min_p = cls._parse_float(block.get("minimal_price"))
+            idx_val = cls._parse_float(block.get("price_index_value"))
+            if min_p > 0 and idx_val > 0:
+                calc_price = round(min_p * idx_val)
+                # Если расчетная витринная цена адекватна (меньше цены продавца и больше 30 ₽)
+                if 30.0 <= calc_price < seller_price:
+                    #calc_price — это зеленая цена/цена витрины Ozon; цена без карты Ozon Банка на ~12% выше (но не выше seller_price)
+                    wallet_p = float(calc_price)
+                    no_card_p = float(min(round(seller_price), round(wallet_p / 0.88)))
+                    return no_card_p, wallet_p
+        return 0.0, 0.0
+
     async def get_prices(self, skus: List[str], offer_ids: List[str] | None = None) -> Dict[str, Dict[str, Any]]:
         if not skus and not offer_ids:
             return {}
@@ -196,6 +220,7 @@ class OzonClient:
                     "price": self._parse_float(inf.get("price")),
                     "marketing_price": self._parse_float(inf.get("marketing_price")),
                     "min_price": self._parse_float(inf.get("min_price")),
+                    "price_indexes": inf.get("price_indexes") or {},
                 }
 
             v5_pids = pids_for_v5 if pids_for_v5 else clean_nums
@@ -216,15 +241,6 @@ class OzonClient:
                             items = data.get("items")
                             if items is None and isinstance(data.get("result"), dict):
                                 items = data["result"].get("items", [])
-                            if items:
-                                # Выводим в лог именно блок price и marketing_actions первого товара (без обрезки!)
-                                s_it = items[0]
-                                logger.info(
-                                    "OZON V5 PRICE DETAIL (offer=%s): price_obj=%s | mkt_actions=%s",
-                                    s_it.get("offer_id"),
-                                    json.dumps(s_it.get("price") or {}, ensure_ascii=False),
-                                    json.dumps(s_it.get("marketing_actions") or {}, ensure_ascii=False)
-                                )
                             for it in (items or []):
                                 pid_s = str(it.get("product_id") or "")
                                 v5_map[pid_s] = it
@@ -236,6 +252,7 @@ class OzonClient:
                 inf = pid_to_info.get(pid_s, {})
                 it_v5 = v5_map.get(pid_s, {})
                 p_v5 = it_v5.get("price") or {}
+                p_indexes = it_v5.get("price_indexes") or inf.get("price_indexes") or {}
 
                 real_sku = inf.get("real_sku") or pid_s
                 offer_id = inf.get("offer_id") or ""
@@ -243,23 +260,29 @@ class OzonClient:
                 # 1. Цена продавца
                 base_seller_p = self._parse_float(p_v5.get("price")) or inf.get("price", 0.0)
                 fbo_action_p = self._parse_float(p_v5.get("marketing_seller_price")) or base_seller_p
-                seller_price = base_seller_p if base_seller_p > 0 else fbo_action_p
+                seller_price = fbo_action_p if (0 < fbo_action_p < base_seller_p) else base_seller_p
 
-                # 2. Цена покупателя из официальных ценовых полей (без чтения процентов из marketing_actions!)
-                candidates_client = [
-                    inf.get("marketing_price", 0.0),
-                    self._parse_float(p_v5.get("marketing_price")),
-                    self._parse_float(p_v5.get("retail_price")),
-                    fbo_action_p,
-                ]
-                # Отсекаем любые значения < 30 ₽, чтобы случайный процент скидки никогда не стал ценой
-                valid_client = [c for c in candidates_client if c >= 30.0]
-                client_price = min(valid_client) if valid_client else seller_price
-                wallet_price = client_price
+                # 2. Вычисляем реальную цену витрины через price_indexes (minimal_price * price_index_value)
+                idx_no_card_p, idx_wallet_p = self._calc_storefront_from_index(p_indexes, seller_price)
 
+                if idx_wallet_p > 0:
+                    client_price = idx_no_card_p
+                    wallet_price = idx_wallet_p
+                else:
+                    api_mkt = inf.get("marketing_price", 0.0) or self._parse_float(p_v5.get("marketing_price"))
+                    if 30.0 <= api_mkt < seller_price:
+                        client_price = api_mkt
+                        wallet_price = round(api_mkt * 0.915, 2)
+                    else:
+                        client_price = seller_price
+                        wallet_price = seller_price
+
+                # 3. Процент Соинвеста Ozon
                 coinvest = 0
                 if seller_price > 0 and 0 < client_price < seller_price:
                     coinvest = round(((seller_price - client_price) / seller_price) * 100)
+                elif seller_price > 0 and 0 < wallet_price < seller_price:
+                    coinvest = round(((seller_price - wallet_price) / seller_price) * 100)
 
                 entry = {
                     "seller_price": round(seller_price, 2),
