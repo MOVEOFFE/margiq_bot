@@ -1,0 +1,11 @@
+﻿aiogram
+aiohttp
+sqlalchemy
+aiosqlite
+apscheduler
+cryptography
+pydantic
+pydantic-settings
+python-dotenv
+playwright
+tzdata

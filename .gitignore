@@ -1,0 +1,11 @@
+﻿.env
+*.db
+*.db-journal
+__pycache__/
+backups/
+.idea/
+.vscode/
+venv/
+.venv/
+test_*.py
+*.csv
